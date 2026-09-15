@@ -11,7 +11,7 @@ export async function GET(req: NextRequest) {
     const query = url.searchParams.get("q");
     const vendorId = url.searchParams.get("vendorId");
 
-    // Check if the caller is logged in to allow vendors to see their own items
+    // 1. Check if caller is authenticated
     let currentUser: { id: string } | null = null;
     try {
       currentUser = await requireUser();
@@ -19,7 +19,7 @@ export async function GET(req: NextRequest) {
       currentUser = null;
     }
 
-    // Determine if the caller owns the vendor store being explicitly queried
+    // 2. Check if the authenticated user owns this specific vendor
     let isSpecificOwner = false;
     if (vendorId && currentUser) {
       const vendorCheck = await db.vendorProfile.findUnique({
@@ -31,19 +31,26 @@ export async function GET(req: NextRequest) {
       }
     }
 
+    // 3. Find IDs of all public vendors to avoid invalid relation operators
+    let allowedVendorIds: string[] | undefined = undefined;
+    if (!isSpecificOwner) {
+      const publicVendors = await db.vendorProfile.findMany({
+        where: { visibility: "PUBLIC" },
+        select: { id: true },
+      });
+      allowedVendorIds = publicVendors.map((v) => v.id);
+    }
+
+    // 4. Query products using vendorId instead of nested vendor object
     const products = await db.product.findMany({
       where: {
         ...(category && category !== "All" ? { category } : {}),
-        ...(vendorId ? { vendorId } : {}),
-        ...(query ? { name: { contains: query, mode: "insensitive" } } : {}),
-        // Exclude products from PRIVATE or non-public vendors unless the owner is viewing their own store
-        ...(!isSpecificOwner
-          ? {
-              vendor: {
-                visibility: "PUBLIC",
-              },
-            }
+        ...(vendorId
+          ? { vendorId }
+          : allowedVendorIds
+          ? { vendorId: { in: allowedVendorIds } }
           : {}),
+        ...(query ? { name: { contains: query, mode: "insensitive" } } : {}),
       },
       include: {
         vendor: {
@@ -60,7 +67,6 @@ export async function GET(req: NextRequest) {
       take: 50,
     });
 
-    // Transform to UI shape with safe fallbacks
     const transformed = products.map((p) => ({
       id: p.id,
       vendorId: p.vendorId,
@@ -92,6 +98,9 @@ export async function GET(req: NextRequest) {
 }
 
 // POST /api/products — vendor creates a product under their own store.
+// The vendorId always comes from the caller's own vendor profile, never
+// from the request body, so one vendor can never create products on
+// behalf of another.
 export async function POST(req: NextRequest) {
   try {
     const user = await requireUser();
@@ -103,6 +112,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Capability-status enforcement.
     const vendorCap = checkCapability(user, "VENDOR");
     if (!vendorCap.hasCapability) {
       return NextResponse.json(
