@@ -30,6 +30,7 @@
     "firebase-admin": "^14.3.0",
     "input-otp": "^1.4.2",
     "jose": "^6.2.11",
+    "jwks-rsa": "^3.1.5",
     "leaflet": "^1.9.4",
     "lucide-react": "^0.525.0",
     "mongodb": "^7.6.0",

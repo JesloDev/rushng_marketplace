@@ -1,33 +1,20 @@
 "use client";
 
 /**
- * Google Sign-In via Firebase Authentication — REDIRECT flow.
- *
- * Why redirect instead of popup:
- *   The popup flow (`signInWithPopup`) has a known bug in Firebase
- *   Auth v12 where the Google Identity Services (GIS) library loads
- *   asynchronously and the popup opens before GIS is ready, causing
- *   "INTERNAL ASSERTION FAILED: Pending promise was never set".
- *   This affects Firefox, Safari ITP, mobile webviews, and popup
- *   blockers.
- *
- *   The redirect flow (`signInWithRedirect`) navigates the entire
- *   page to Google's auth page, then back to the app with the result.
- *   No popup, no GIS timing issue. Works everywhere.
+ * Google Sign-In via Firebase Authentication — POPUP flow.
  *
  * Flow:
  *   1. User clicks "Continue with Google".
- *   2. Browser navigates to accounts.google.com.
- *   3. User picks account → Google redirects back to the app.
- *   4. On mount, AuthScreen calls `handleRedirectResult()` which
- *      checks `getRedirectResult()` for the completed sign-in.
- *   5. If a user is returned, we get the ID token and POST it to
- *      /api/auth/firebase to create the RUSH session cookie.
+ *   2. Firebase opens Google's authentication page in a popup.
+ *   3. User selects/signs into their Google account.
+ *   4. The popup closes and Firebase returns the authenticated user.
+ *   5. We obtain the fresh Firebase ID token.
+ *   6. We POST the ID token to /api/auth/firebase.
+ *   7. The server creates the RUSH session cookie.
  */
 
 import {
-  signInWithRedirect,
-  getRedirectResult,
+  signInWithPopup,
   type UserCredential,
 } from "firebase/auth";
 
@@ -43,11 +30,7 @@ import {
 } from "./types";
 
 /**
- * Start Google sign-in using a full-page redirect.
- *
- * This navigates AWAY from the app — the browser goes to Google,
- * the user picks an account, then Google redirects back. The result
- * is handled by `handleRedirectResult()` on the next page load.
+ * Start Google sign-in using a popup.
  */
 export async function signInWithGoogle(): Promise<AuthResult> {
   if (!isFirebaseConfigured || !firebaseAuth || !firebaseGoogleProvider) {
@@ -57,88 +40,94 @@ export async function signInWithGoogle(): Promise<AuthResult> {
     );
   }
 
-  // This navigates away from the page — the promise resolves after
-  // the redirect is initiated, NOT after the user signs in. The
-  // actual sign-in result is handled by handleRedirectResult() on
-  // the next page load.
-  await signInWithRedirect(firebaseAuth, firebaseGoogleProvider);
-
-  // This return never executes in practice — the page navigates
-  // away before we get here. But TypeScript needs a return value.
-  return { id: "", email: "", name: "" };
-}
-
-/**
- * Check for a completed Google redirect sign-in.
- *
- * Call this on AuthScreen mount. If the user just came back from
- * Google's auth page, `getRedirectResult()` returns the credential.
- * We extract the ID token and POST it to /api/auth/firebase to
- * create the RUSH session cookie.
- *
- * Returns null if there's no redirect result (normal page load,
- * not returning from Google).
- */
-export async function handleRedirectResult(): Promise<AuthResult | null> {
-  if (!isFirebaseConfigured || !firebaseAuth) {
-    return null;
-  }
+  let cred: UserCredential;
 
   try {
-    const cred: UserCredential | null = await getRedirectResult(firebaseAuth);
-
-    if (!cred || !cred.user) {
-      return null;
-    }
-
-    const idToken = await cred.user.getIdToken();
-
-    const res = await fetch("/api/auth/firebase", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ idToken }),
-    });
-
-    if (!res.ok) {
-      const err = await res
-        .json()
-        .catch(() => ({ error: "Login failed" }));
-
-      throw new AuthError(
-        err.error || `Login failed (${res.status})`,
-        String(res.status),
-      );
-    }
-
-    const data = await res.json();
-
-    return {
-      id: data.user.id,
-      email: data.user.email,
-      name: data.user.name,
-    };
+    cred = await signInWithPopup(
+      firebaseAuth,
+      firebaseGoogleProvider,
+    );
   } catch (error: any) {
-    if (error?.code === "auth/redirect-cancelled-by-user") {
+    // 1. Popup closed by user
+    if (error?.code === "auth/popup-closed-by-user") {
       throw new AuthError(
         "Google sign-in was cancelled.",
-        "GOOGLE_REDIRECT_CANCELLED",
+        "GOOGLE_POPUP_CLOSED",
       );
     }
 
-    if (error instanceof AuthError) {
-      throw error;
+    // 2. Browser blocked the popup window
+    if (error?.code === "auth/popup-blocked") {
+      throw new AuthError(
+        "Sign-in popup was blocked by your browser. Please allow popups for this site.",
+        "GOOGLE_POPUP_BLOCKED",
+      );
     }
 
-    throw error;
+    // 3. Another popup attempt was initiated
+    if (error?.code === "auth/cancelled-popup-request") {
+      throw new AuthError(
+        "Sign-in request was superseded by another attempt.",
+        "GOOGLE_POPUP_CANCELLED",
+      );
+    }
+
+    // 4. Unauthorized domain in Firebase Console
+    if (error?.code === "auth/unauthorized-domain") {
+      throw new AuthError(
+        "This domain is not authorized in the Firebase Console.",
+        "UNAUTHORIZED_DOMAIN",
+      );
+    }
+
+    throw new AuthError(
+      error?.message || "Failed to complete Google authentication.",
+      error?.code || "GOOGLE_AUTH_FAILED",
+    );
   }
+
+  if (!cred?.user) {
+    throw new AuthError(
+      "Google sign-in did not return a user.",
+      "GOOGLE_SIGN_IN_FAILED",
+    );
+  }
+
+  // Retrieve token (force refresh to guarantee valid timestamps on backend)
+  const idToken = await cred.user.getIdToken(true);
+
+  // Exchange ID token for your application session cookie
+  const res = await fetch("/api/auth/firebase", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ idToken }),
+  });
+
+  if (!res.ok) {
+    const err = await res
+      .json()
+      .catch(() => ({ error: "Failed to exchange session" }));
+
+    throw new AuthError(
+      err.error || `Login failed with status ${res.status}`,
+      String(res.status),
+    );
+  }
+
+  const data = await res.json();
+
+  return {
+    id: data.user.id,
+    email: data.user.email,
+    name: data.user.name,
+  };
 }
 
 export async function signOutFirebase() {
   if (!firebaseAuth) return;
 
   const { signOut } = await import("firebase/auth");
-
   await signOut(firebaseAuth);
 }

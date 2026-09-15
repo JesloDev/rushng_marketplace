@@ -11,12 +11,38 @@ export async function GET(req: NextRequest) {
     const query = url.searchParams.get("q");
     const vendorId = url.searchParams.get("vendorId");
 
+    // Check if the caller is logged in to allow vendors to see their own items
+    let currentUser: { id: string } | null = null;
+    try {
+      currentUser = await requireUser();
+    } catch {
+      currentUser = null;
+    }
+
+    // Determine if the caller owns the vendor store being explicitly queried
+    let isSpecificOwner = false;
+    if (vendorId && currentUser) {
+      const vendorCheck = await db.vendorProfile.findUnique({
+        where: { id: vendorId },
+        select: { userId: true },
+      });
+      if (vendorCheck && vendorCheck.userId === currentUser.id) {
+        isSpecificOwner = true;
+      }
+    }
+
     const products = await db.product.findMany({
       where: {
         ...(category && category !== "All" ? { category } : {}),
         ...(vendorId ? { vendorId } : {}),
-        ...(query
-          ? { name: { contains: query } }
+        ...(query ? { name: { contains: query, mode: "insensitive" } } : {}),
+        // Exclude products from PRIVATE or non-public vendors unless the owner is viewing their own store
+        ...(!isSpecificOwner
+          ? {
+              vendor: {
+                visibility: "PUBLIC",
+              },
+            }
           : {}),
       },
       include: {
@@ -26,6 +52,7 @@ export async function GET(req: NextRequest) {
             businessName: true,
             slug: true,
             location: true,
+            visibility: true,
           },
         },
       },
@@ -33,14 +60,12 @@ export async function GET(req: NextRequest) {
       take: 50,
     });
 
-    // Transform to UI shape. Use safeJsonParse for JSON-string fields
-    // (images, tags) — one bad row previously crashed the whole list
-    // because JSON.parse(undefined) throws synchronously inside .map().
+    // Transform to UI shape with safe fallbacks
     const transformed = products.map((p) => ({
       id: p.id,
       vendorId: p.vendorId,
-      vendorName: p.vendor.businessName,
-      vendorSlug: p.vendor.slug,
+      vendorName: p.vendor?.businessName ?? "Unknown Store",
+      vendorSlug: p.vendor?.slug ?? "",
       name: p.name,
       description: p.description,
       price: p.price,
@@ -58,11 +83,6 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({ products: transformed });
   } catch (err: any) {
-    // Public read endpoint — must never 500 with a stack trace.
-    // Log the real error server-side, return a structured 500 to the
-    // client so TanStack Query marks it as `error` and the screen
-    // shows the "Something went wrong, try again" state with a retry
-    // button (instead of crashing the whole homepage).
     console.error("[products GET] error", err?.message ?? err);
     return NextResponse.json(
       { error: "Failed to load products", details: err?.message },
@@ -72,9 +92,6 @@ export async function GET(req: NextRequest) {
 }
 
 // POST /api/products — vendor creates a product under their own store.
-// The vendorId always comes from the caller's own vendor profile, never
-// from the request body, so one vendor can never create products on
-// behalf of another.
 export async function POST(req: NextRequest) {
   try {
     const user = await requireUser();
@@ -86,11 +103,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ⚠ Capability-status enforcement. A vendor whose VENDOR
-    // capability has been SUSPENDED (e.g. by an admin for abuse)
-    // shouldn't be able to keep listing new products. Same for
-    // PENDING_VERIFICATION — although vendors self-activate on
-    // onboarding, an admin could move them to PENDING to gate them.
     const vendorCap = checkCapability(user, "VENDOR");
     if (!vendorCap.hasCapability) {
       return NextResponse.json(
@@ -122,11 +134,7 @@ export async function POST(req: NextRequest) {
     if (imageList.length === 0) {
       return NextResponse.json({ error: "Add at least one product photo." }, { status: 400 });
     }
-    // Defense-in-depth: image URLs must be either our own /api/uploads/
-    // paths (GridFS — current pattern), /uploads/ paths (legacy
-    // filesystem pattern, kept for backward compat), or an https URL.
-    // Rejects javascript:, data:, file:, etc. even if a malicious
-    // caller posts directly to the API bypassing the UI.
+
     for (const url of imageList) {
       if (typeof url !== "string" || (!url.startsWith("/api/uploads/") && !url.startsWith("/uploads/") && !url.startsWith("https://"))) {
         return NextResponse.json(

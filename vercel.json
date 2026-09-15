@@ -7,5 +7,11 @@
   "env": {
     "MONGODB_DB": "rush"
   },
+  "rewrites": [
+    {
+      "source": "/__/auth/:path*",
+      "destination": "https://rushng-8f60e.firebaseapp.com/__/auth/:path*"
+    }
+  ],
   "crons": []
 }
